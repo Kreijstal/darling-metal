@@ -25,7 +25,7 @@ typedef NS_ENUM(NSUInteger, MTLTextureType) {
 	MTLTextureTypeTextureBuffer = 9,
 };
 
-typedef NS_ENUM(uint8, MTLTextureSwizzle) {
+typedef NS_ENUM(uint8_t, MTLTextureSwizzle) {
 	MTLTextureSwizzleZero = 0,
 	MTLTextureSwizzleOne = 1,
 	MTLTextureSwizzleRed = 2,
