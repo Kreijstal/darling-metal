@@ -7,6 +7,9 @@ remove_sdk_framework(Metal)
 remove_sdk_framework(MetalKit)
 remove_sdk_framework(MetalPerformanceShaders)
 
+# Metal's source-compiler API declarations are needed even when the backend is disabled.
+include(deps/mslc/sources.cmake)
+
 if (BUILD_METAL)
 	add_subdirectory(deps/indium)
 
@@ -23,7 +26,6 @@ if (BUILD_METAL)
 	# The public surface is a C ABI declared in deps/mslc/include/mslc/mslc.h, which
 	# is what Metal.framework includes. No C++ of mslc's is visible past it.
 	#
-	include(deps/mslc/sources.cmake)
 	set(DYLIB_INSTALL_NAME "/usr/lib/darling/libmslc.dylib")
 	# 64-bit only: mslc uses 128-bit integers, which the 32-bit slice cannot compile. Metal loads
 	# the library when source is compiled instead of linking it, so its 32-bit slice does not
@@ -176,9 +178,10 @@ generate_sdk_framework(MetalKit
 	HEADER "include/MetalKit"
 )
 
+target_include_directories(Metal PRIVATE ${MSLC_PUBLIC_INCLUDE_DIRS})
+
 if (BUILD_METAL)
 	add_dependencies(Metal mslc)
-	target_include_directories(Metal PRIVATE ${MSLC_PUBLIC_INCLUDE_DIRS})
 endif()
 
 add_framework(MetalKit
