@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Darling Developers
 // SPDX-License-Identifier: MPL-2.0
 
+#import <Metal/MTLTypesInternal.h>
 #import <Metal/MTLRenderPipelineInternal.h>
+#import <Metal/MTLVertexDescriptorInternal.h>
 #import <Metal/stubs.h>
 #import <Metal/MTLLibraryInternal.h>
 #import <Metal/MTLPipelineInternal.h>
@@ -204,7 +206,7 @@ MTL_UNSUPPORTED_CLASS
 		((MTLFunctionInternal*)_fragmentFunction).function,
 		_maxVertexCallStackDepth,
 		_maxFragmentCallStackDepth,
-		std::nullopt, // TODO
+		(_vertexDescriptor == nil) ? std::nullopt : std::make_optional([_vertexDescriptor asIndiumDescriptor]),
 		[_vertexBuffers asIndiumDescriptors],
 		[_fragmentBuffers asIndiumDescriptors],
 		[_colorAttachments asContiguousIndiumDescriptors],
@@ -312,12 +314,18 @@ MTL_UNSUPPORTED_CLASS
 
 - (std::vector<Indium::RenderPipelineColorAttachmentDescriptor>)asContiguousIndiumDescriptors
 {
-	auto tmp1 = [self asIndiumDescriptors];
-	std::map<size_t, Indium::RenderPipelineColorAttachmentDescriptor> tmp2(tmp1.begin(), tmp1.end());
+	// Keep attachment N at index N, as the render pass does. A slot that was never configured
+	// has MTLPixelFormatInvalid, which Indium treats as no attachment.
+	auto indexed = [self asIndiumDescriptors];
 	std::vector<Indium::RenderPipelineColorAttachmentDescriptor> result;
+	Indium::RenderPipelineColorAttachmentDescriptor unused {};
+	unused.pixelFormat = Indium::PixelFormat::Invalid;
 
-	for (const auto& [key, value]: tmp2) {
-		result.push_back(value);
+	for (const auto& [index, value]: indexed) {
+		if (index >= result.size()) {
+			result.resize(index + 1, unused);
+		}
+		result[index] = value;
 	}
 
 	return result;
@@ -422,6 +430,17 @@ MTL_UNSUPPORTED_CLASS
 @synthesize state = _state;
 @synthesize device = _device;
 @synthesize label = _label;
+
+const std::shared_ptr<Indium::RenderPipelineState>& MTLRenderPipelineStateGetIndium(id<MTLRenderPipelineState> object)
+{
+	static const std::shared_ptr<Indium::RenderPipelineState> none;
+	static const Class internalClass = [MTLRenderPipelineStateInternal class];
+
+	if (!MTLObjectIsInstanceOf(object, internalClass)) {
+		return none;
+	}
+	return ((MTLRenderPipelineStateInternal*)object)->_state;
+}
 
 - (instancetype)initWithState: (std::shared_ptr<Indium::RenderPipelineState>)state
                        device: (id<MTLDevice>)device

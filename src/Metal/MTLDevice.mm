@@ -7,20 +7,64 @@
 #import <Metal/MTLComputePipelineInternal.h>
 #import <Metal/MTLCommandQueueInternal.h>
 #import <Metal/MTLBufferInternal.h>
+#import <Metal/MTLHeapInternal.h>
 #import <Metal/MTLLibraryInternal.h>
 #import <Metal/stubs.h>
 #import <Metal/MTLRenderPipelineInternal.h>
+#import <Metal/MTLIndiumErrors.h>
+#import <Metal/MTLArgumentInternal.h>
 #import <Metal/MTLTextureDescriptorInternal.h>
 #import <Metal/MTLTextureInternal.h>
+#import <IOSurface/IOSurfaceRef.h>
+#import <IOSurface/IOSurfacePriv.h>
 #import <Metal/MTLSamplerDescriptorInternal.h>
 #import <Metal/MTLSamplerStateInternal.h>
+#import <Metal/MTLEventInternal.h>
+#import <Metal/MTLFenceInternal.h>
 #import <Metal/MTLDepthStencilDescriptorInternal.h>
+#import <Metal/MTLDeviceInfo.h>
+#import <Metal/MTLCompileOptions.h>
 #import <Metal/MTLMSLReflection.h>
 
 #include <mslc/mslc.h>
+#include <mach/mach_time.h>
 
+#include <dlfcn.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
+#include <vector>
+
+// mslc is a 64-bit-only library (it needs 128-bit integers that the 32-bit slice of this
+// framework cannot compile), so Metal does not link it: it is loaded the first time source
+// is compiled. In a 32-bit process, or when the library is missing, source compilation is
+// reported as unsupported.
+namespace {
+struct MslcApi {
+	void (*default_options)(MslcOptions*);
+	int (*translate)(const char*, size_t, const MslcOptions*, uint8_t**, size_t*, char**, char**);
+	void (*free_buffer)(void*);
+};
+
+const MslcApi* LoadMslc() {
+	static MslcApi api;
+	static const MslcApi* loaded = nullptr;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+#if !defined(__i386__)
+		void* handle = dlopen("/usr/lib/darling/libmslc.dylib", RTLD_NOW | RTLD_LOCAL);
+		if (handle) {
+			api.default_options = (void (*)(MslcOptions*)) dlsym(handle, "mslc_default_options");
+			api.translate = (int (*)(const char*, size_t, const MslcOptions*, uint8_t**, size_t*, char**, char**)) dlsym(handle, "mslc_translate");
+			api.free_buffer = (void (*)(void*)) dlsym(handle, "mslc_free");
+			if (api.default_options && api.translate && api.free_buffer)
+				loaded = &api;
+		}
+#endif
+	});
+	return loaded;
+}
+}
 
 MTL_EXTERN const MTLDeviceNotificationName MTLDeviceWasAddedNotification = @"MTLDeviceWasAdded";
 MTL_EXTERN const MTLDeviceNotificationName MTLDeviceRemovalRequestedNotification = @"MTLDeviceRemovalRequested";
@@ -32,18 +76,107 @@ static NSMutableArray<MTLDeviceInternal*>* devices = nil;
 static dispatch_once_t devicesInitToken = 0;
 static MTLDeviceInternal* systemDefaultDevice = nil;
 
+// Platform identity settings (org.darlinghq.platform, as for the rest of the system's identity).
+// They are read once, when the device list is made.
+static CFPropertyListRef copyPlatformPreference(CFStringRef key) {
+	return CFPreferencesCopyValue(key, CFSTR("org.darlinghq.platform"), kCFPreferencesAnyUser, kCFPreferencesCurrentHost);
+}
+
+// PreferredGPU: the index of a device in MTLCopyAllDevices() or a part of its name.
+static std::string preferredGPU(void) {
+	std::string preference;
+	CFPropertyListRef value = copyPlatformPreference(CFSTR("PreferredGPU"));
+	if (!value) {
+		return preference;
+	}
+	if (CFGetTypeID(value) == CFStringGetTypeID()) {
+		preference = [(NSString*)value UTF8String] ?: "";
+	} else if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+		long long index = -1;
+		if (CFNumberGetValue((CFNumberRef)value, kCFNumberLongLongType, &index) && index >= 0) {
+			preference = std::to_string(index);
+		}
+	}
+	CFRelease(value);
+	return preference;
+}
+
+static BOOL copyBoolPreference(CFStringRef key, BOOL* result) {
+	CFPropertyListRef value = copyPlatformPreference(key);
+	if (!value) {
+		return NO;
+	}
+	BOOL found = NO;
+	if (CFGetTypeID(value) == CFBooleanGetTypeID()) {
+		*result = CFBooleanGetValue((CFBooleanRef)value);
+		found = YES;
+	} else if (CFGetTypeID(value) == CFNumberGetTypeID()) {
+		long long number = 0;
+		if (CFNumberGetValue((CFNumberRef)value, kCFNumberLongLongType, &number)) {
+			*result = number != 0;
+			found = YES;
+		}
+	}
+	CFRelease(value);
+	return found;
+}
+
+static void applyPlatformIdentity(MTLDeviceInternal* defaultDevice) {
+	CFPropertyListRef name = copyPlatformPreference(CFSTR("GPUName"));
+	if (name) {
+		if (CFGetTypeID(name) == CFStringGetTypeID() && CFStringGetLength((CFStringRef)name) > 0) {
+			[defaultDevice setReportedName: (NSString*)name];
+		}
+		CFRelease(name);
+	}
+
+	CFPropertyListRef memory = copyPlatformPreference(CFSTR("GPUMemoryMB"));
+	if (memory) {
+		long long megabytes = 0;
+		if (CFGetTypeID(memory) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)memory, kCFNumberLongLongType, &megabytes) &&
+		    megabytes > 0 && static_cast<unsigned long long>(megabytes) <= UINT64_MAX / (1024 * 1024)) {
+			[defaultDevice setReportedWorkingSetSize: static_cast<uint64_t>(megabytes) * 1024 * 1024];
+		}
+		CFRelease(memory);
+	}
+
+	BOOL unifiedMemory = YES;
+	if (copyBoolPreference(CFSTR("GPUHasUnifiedMemory"), &unifiedMemory)) {
+		for (MTLDeviceInternal* device in devices) {
+			[device setReportedUnifiedMemory: unifiedMemory];
+		}
+	}
+}
+
 static void ensureDevices(void) {
 	dispatch_once(&devicesInitToken, ^{
 		ensureMetalInitialized();
 		devices = [NSMutableArray new];
 
-		// for now, we just have the system default device
-		auto indiumDevice = Indium::createSystemDefaultDevice();
-		if (indiumDevice) {
-			systemDefaultDevice = [[MTLDeviceInternal alloc] initWithDevice: indiumDevice];
-
-			[devices addObject: systemDefaultDevice];
+		// Indium lists the default device first. Wrapping a device is cheap: Indium creates its
+		// Vulkan device only once something is created on it.
+		for (const auto& indiumDevice: Indium::copyAllDevices()) {
+			MTLDeviceInternal* device = [[MTLDeviceInternal alloc] initWithDevice: indiumDevice];
+			[devices addObject: device];
+			[device release];
 		}
+
+		if (devices.count == 0) {
+			return;
+		}
+
+		auto chosen = Indium::createSystemDefaultDevice(preferredGPU());
+		for (MTLDeviceInternal* device in devices) {
+			if (device.device == chosen) {
+				systemDefaultDevice = [device retain];
+				break;
+			}
+		}
+		if (!systemDefaultDevice) {
+			systemDefaultDevice = [devices[0] retain];
+		}
+
+		applyPlatformIdentity(systemDefaultDevice);
 	});
 };
 
@@ -64,26 +197,8 @@ void MTLDeviceDestroyAll(void) {
 
 #endif
 
-static bool metalDisabledByEnvironment(void) {
-	const char* disable = getenv("DARLING_METAL_DISABLE");
-	if (disable && disable[0] != '\0' && disable[0] != '0') {
-		return true;
-	}
-	const char* enable = getenv("DARLING_ENABLE_METAL");
-	if (enable && (enable[0] == '1' || enable[0] == 'y' || enable[0] == 'Y')) {
-		return false;
-	}
-	// By default, since Metal AIR translation and render pipelines are still under active development
-	// (e.g. advanced texture samplers in Iridium), keep Metal gated behind DARLING_ENABLE_METAL=1
-	// so SDL2 / OpenGL games automatically fall back to the mature OpenGL renderer.
-	return true;
-}
-
 MTL_EXTERN
 id<MTLDevice> MTLCreateSystemDefaultDevice(void) {
-	if (metalDisabledByEnvironment()) {
-		return nil;
-	}
 #if DARLING_METAL_ENABLED
 	ensureDevices();
 	if (systemDefaultDevice) {
@@ -95,9 +210,6 @@ id<MTLDevice> MTLCreateSystemDefaultDevice(void) {
 
 MTL_EXTERN
 NSArray<id<MTLDevice>>* MTLCopyAllDevices(void) {
-	if (metalDisabledByEnvironment()) {
-		return [NSArray new];
-	}
 #if DARLING_METAL_ENABLED
 	ensureDevices();
 	return [devices copy];
@@ -137,7 +249,10 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 	NSThread* _pollingThread;
 	NSCondition* _threadExitCondition;
 	BOOL _threadIsRunning;
-	id<MTLCommandQueue> _implicitQueue;
+	NSString* _name;
+	BOOL _lowPower;
+	uint64_t _reportedWorkingSetSize;
+	BOOL _unifiedMemory;
 }
 
 @synthesize device = _device;
@@ -163,6 +278,24 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 	self = [super init];
 	if (self != nil) {
 		_device = device;
+		_name = [[NSString alloc] initWithUTF8String: MTLDeviceInfo::metalNameFromVulkanName(_device->name().c_str()).c_str()];
+
+		// On a Mac with automatic graphics switching, the integrated GPU is the low-power one.
+		if (_device->deviceType() == Indium::DeviceType::IntegratedGPU) {
+			for (const auto& other: Indium::copyAllDevices()) {
+				if (other->deviceType() == Indium::DeviceType::DiscreteGPU) {
+					_lowPower = YES;
+					break;
+				}
+			}
+		}
+
+		// Implementation limit: Indium does not complete the Managed (didModifyRange:,
+		// synchronizeResource:) and Private upload paths that applications take on a GPU without
+		// unified memory, so every device reports unified memory until they work, unless the
+		// GPUHasUnifiedMemory setting says otherwise.
+		_unifiedMemory = YES;
+
 		_threadExitCondition = [NSCondition new];
 		_threadIsRunning = NO;
 		_pollingThread = [[NSThread alloc] initWithTarget: self selector: @selector(pollingLoop) object: nil];
@@ -173,9 +306,9 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 
 - (void)dealloc
 {
-	[_implicitQueue release];
 	[_pollingThread release];
 	[_threadExitCondition release];
+	[_name release];
 
 	[super dealloc];
 }
@@ -196,28 +329,162 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 	[_threadExitCondition unlock];
 }
 
+- (NSString*)name
+{
+	return _name;
+}
+
+- (uint64_t)registryID
+{
+	return MTLDeviceInfo::registryIDFromUUID(_device->deviceUUID());
+}
+
+- (BOOL)isLowPower
+{
+	return _lowPower;
+}
+
+- (BOOL)isHeadless
+{
+	// whether a GPU drives no display is not known through Vulkan
+	return NO;
+}
+
+- (BOOL)isRemovable
+{
+	// external GPUs are not told apart from internal ones through Vulkan
+	return NO;
+}
+
+- (BOOL)hasUnifiedMemory
+{
+	return _unifiedMemory;
+}
+
 - (uint64_t)recommendedMaxWorkingSetSize
 {
-	// indium decides this from the device's memory budget where the driver
-	// reports one and from its memory heap size where it does not. See
-	// Indium::PrivateDevice::recommendedMaxWorkingSetSize for why a budget is
-	// the honest analogue and why maxMemoryAllocationCount is not.
-	return _device->recommendedMaxWorkingSetSize();
+	return _reportedWorkingSetSize != 0 ? _reportedWorkingSetSize : _device->recommendedMaxWorkingSetSize();
+}
+
+- (void)setReportedName: (NSString*)name
+{
+	NSString* copy = [name copy];
+	[_name release];
+	_name = copy;
+}
+
+- (void)setReportedWorkingSetSize: (uint64_t)size
+{
+	_reportedWorkingSetSize = size;
+}
+
+- (void)setReportedUnifiedMemory: (BOOL)unifiedMemory
+{
+	_unifiedMemory = unifiedMemory;
 }
 
 - (NSUInteger)maxBufferLength
 {
-	// A hard limit, unlike recommendedMaxWorkingSetSize. See
-	// Indium::PrivateDevice::maxBufferLength for how it is bounded.
-	return _device->maxBufferLength();
+	uint64_t length = _device->maxBufferLength();
+	return length > NSUIntegerMax ? NSUIntegerMax : static_cast<NSUInteger>(length);
 }
 
-- (NSString*)name
+- (BOOL)isDepth24Stencil8PixelFormatSupported
 {
-	// VkPhysicalDeviceProperties::deviceName, which the Vulkan specification
-	// defines as a null-terminated UTF-8 string, so this is the device's own
-	// name in its own encoding and not a guess at one.
-	return [NSString stringWithUTF8String: _device->name().c_str()];
+	return _device->supportsDepth24Stencil8PixelFormat();
+}
+
+- (MTLReadWriteTextureTier)readWriteTextureSupport
+{
+	// Indium binds read-write textures as Vulkan storage images, which every Vulkan device supports
+	return MTLReadWriteTextureTier2;
+}
+
+- (BOOL)supportsFamily: (MTLGPUFamily)gpuFamily
+{
+	return MTLDeviceInfo::supportsFamily(gpuFamily);
+}
+
+- (BOOL)supportsFeatureSet: (MTLFeatureSet)featureSet
+{
+	return MTLDeviceInfo::supportsFeatureSet(featureSet);
+}
+
+- (BOOL)supportsShaderBarycentricCoordinates
+{
+	// See the note in MTLDevice.h: Vulkan has no barycentric decoration to lower
+	// onto, so this says what the backend implements.
+	return NO;
+}
+
+- (BOOL)supports32BitFloatFiltering
+{
+	for (auto format: { Indium::PixelFormat::R32Float, Indium::PixelFormat::RG32Float, Indium::PixelFormat::RGBA32Float }) {
+		if (!_device->supportsPixelFormatSampling(format, true)) {
+			return NO;
+		}
+	}
+	return YES;
+}
+
+- (BOOL)supportsBCTextureCompression
+{
+	for (auto format: {
+		Indium::PixelFormat::BC1_RGBA, Indium::PixelFormat::BC2_RGBA, Indium::PixelFormat::BC3_RGBA,
+		Indium::PixelFormat::BC4_RUnorm, Indium::PixelFormat::BC5_RGUnorm,
+		Indium::PixelFormat::BC6H_RGBUfloat, Indium::PixelFormat::BC7_RGBAUnorm,
+	}) {
+		if (!_device->supportsPixelFormatSampling(format, false)) {
+			return NO;
+		}
+	}
+	return YES;
+}
+
+- (BOOL)supportsPullModelInterpolation
+{
+	return NO;
+}
+
+- (BOOL)areProgrammableSamplePositionsSupported
+{
+	return NO;
+}
+
+- (BOOL)areRasterOrderGroupsSupported
+{
+	return NO;
+}
+
+- (MTLDeviceLocation)location
+{
+	return static_cast<MTLDeviceLocation>(MTLDeviceInfo::locationForDeviceType(static_cast<int>(_device->deviceType())));
+}
+
+- (NSUInteger)locationNumber
+{
+	return MTLDeviceInfo::locationNumberForDeviceType(static_cast<int>(_device->deviceType()), _lowPower);
+}
+
+- (NSArray<id<MTLCounterSet>>*)counterSets
+{
+	return nil;
+}
+
+- (MTLArgumentBuffersTier)argumentBuffersSupport
+{
+	return MTLArgumentBuffersTier1;
+}
+
+- (BOOL)supportsTextureSampleCount: (NSUInteger)sampleCount
+{
+	return sampleCount <= UINT32_MAX && _device->supportsTextureSampleCount(static_cast<uint32_t>(sampleCount));
+}
+
+- (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount: (NSUInteger)maxCommandBufferCount
+{
+	// Indium does not limit the number of uncompleted command buffers on a queue
+	return [self newCommandQueue];
 }
 
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor: (MTLComputePipelineDescriptor*)descriptor
@@ -225,13 +492,23 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
                                                           reflection: (MTLAutoreleasedComputePipelineReflection*)reflection
                                                                error: (NSError**)error
 {
-	auto pso = _device->newComputePipelineState(descriptor.asIndiumDescriptor, static_cast<Indium::PipelineOption>(options), nullptr);
+	if (error) {
+		*error = nil;
+	}
+	if (reflection) {
+		*reflection = nil;
+	}
+	auto pso = MTLCallIndium(error, MTLLibraryErrorInternal, [&]() {
+		return _device->newComputePipelineState(descriptor.asIndiumDescriptor, static_cast<Indium::PipelineOption>(options), nullptr);
+	});
 	if (!pso) {
-		if (error) {
-			// TODO: better error and/or match what the official Metal method does
-			*error = [NSError errorWithDomain: NSPOSIXErrorDomain code: ENOMEM userInfo: nil];
+		if (error && !*error) {
+			*error = MTLErrorWithCode(MTLLibraryErrorInternal, @"The pipeline could not be created");
 		}
 		return nil;
+	}
+	if (reflection) {
+		*reflection = [[[MTLComputePipelineReflection alloc] initWithFunction: ((MTLFunctionInternal*)descriptor.computeFunction).function options: options] autorelease];
 	}
 	return [[MTLComputePipelineStateInternal alloc] initWithState: pso device: self label: descriptor.label];
 }
@@ -250,13 +527,23 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
                                                         reflection: (MTLAutoreleasedComputePipelineReflection*)reflection 
                                                              error: (NSError**)error
 {
-	auto pso = _device->newComputePipelineState(((MTLFunctionInternal*)computeFunction).function, static_cast<Indium::PipelineOption>(options), nullptr);
+	if (error) {
+		*error = nil;
+	}
+	if (reflection) {
+		*reflection = nil;
+	}
+	auto pso = MTLCallIndium(error, MTLLibraryErrorInternal, [&]() {
+		return _device->newComputePipelineState(((MTLFunctionInternal*)computeFunction).function, static_cast<Indium::PipelineOption>(options), nullptr);
+	});
 	if (!pso) {
-		if (error) {
-			// TODO: better error and/or match what the official Metal method does
-			*error = [NSError errorWithDomain: NSPOSIXErrorDomain code: ENOMEM userInfo: nil];
+		if (error && !*error) {
+			*error = MTLErrorWithCode(MTLLibraryErrorInternal, @"The pipeline could not be created");
 		}
 		return nil;
+	}
+	if (reflection) {
+		*reflection = [[[MTLComputePipelineReflection alloc] initWithFunction: ((MTLFunctionInternal*)computeFunction).function options: options] autorelease];
 	}
 	return [[MTLComputePipelineStateInternal alloc] initWithState: pso device: self label: nil];
 }
@@ -264,38 +551,135 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor: (MTLRenderPipelineDescriptor*)descriptor
                                                              error: (NSError**)error
 {
-	if (descriptor == nil || descriptor.vertexFunction == nil) {
-		if (error) {
-			*error = [NSError errorWithDomain: MTLLibraryErrorDomain code: MTLLibraryErrorFunctionNotFound userInfo: nil];
+	return [self newRenderPipelineStateWithDescriptor: descriptor options: MTLPipelineOptionNone reflection: nil error: error];
+}
+
+- (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor: (MTLRenderPipelineDescriptor*)descriptor
+                                                           options: (MTLPipelineOption)options
+                                                        reflection: (MTLAutoreleasedRenderPipelineReflection*)reflection
+                                                             error: (NSError**)error
+{
+	if (reflection) {
+		*reflection = nil;
+	}
+	if (error) {
+		*error = nil;
+	}
+	auto pso = MTLCallIndium(error, MTLLibraryErrorInternal, [&]() {
+		return _device->newRenderPipelineState([descriptor asIndiumDescriptor]);
+	});
+	if (!pso) {
+		if (error && !*error) {
+			*error = MTLErrorWithCode(MTLLibraryErrorInternal, @"The pipeline could not be created");
 		}
 		return nil;
 	}
-	try {
-		auto pso = _device->newRenderPipelineState([descriptor asIndiumDescriptor]);
-		if (!pso) {
-			if (error) {
-				*error = [NSError errorWithDomain: MTLLibraryErrorDomain code: MTLLibraryErrorInternal userInfo: nil];
-			}
-			return nil;
-		}
-		return [[MTLRenderPipelineStateInternal alloc] initWithState: pso device: self label: descriptor.label];
-	} catch (const std::exception& e) {
-		if (error) {
-			*error = [NSError errorWithDomain: MTLLibraryErrorDomain code: MTLLibraryErrorInternal userInfo: @{
-				NSLocalizedDescriptionKey: [NSString stringWithUTF8String: e.what()]
-			}];
-		}
-		return nil;
+	if (reflection) {
+		*reflection = [[[MTLRenderPipelineReflection alloc] initWithVertexFunction: ((MTLFunctionInternal*)descriptor.vertexFunction).function
+		                                                         fragmentFunction: ((MTLFunctionInternal*)descriptor.fragmentFunction).function
+		                                                                  options: options] autorelease];
 	}
+	return [[MTLRenderPipelineStateInternal alloc] initWithState: pso device: self label: descriptor.label];
 }
 
 - (id<MTLTexture>)newTextureWithDescriptor: (MTLTextureDescriptor*)descriptor
 {
-	auto texture = _device->newTexture([descriptor asIndiumDescriptor]);
+	// indium reports a texture the device cannot make (an unsupported format, usage or sample count) by
+	// throwing; the method's contract is a nil texture.
+	std::shared_ptr<Indium::Texture> texture;
+	try {
+		texture = _device->newTexture([descriptor asIndiumDescriptor]);
+	} catch (const std::exception&) {
+		return nil;
+	}
 	if (!texture) {
 		return nil;
 	}
 	return [[MTLTextureInternal alloc] initWithTexture: texture device: self resourceOptions: descriptor.resourceOptions];
+}
+
+// The size of one pixel of the formats an IOSurface plane can back here, or 0. These are the
+// uncompressed color formats whose memory layout is the same in a linear Vulkan image.
+static size_t iosurfacePixelSize(MTLPixelFormat format)
+{
+	switch (format) {
+	case MTLPixelFormatR8Unorm:
+		return 1;
+	case MTLPixelFormatRG8Unorm:
+		return 2;
+	case MTLPixelFormatRGBA8Unorm:
+	case MTLPixelFormatRGBA8Unorm_sRGB:
+	case MTLPixelFormatBGRA8Unorm:
+	case MTLPixelFormatBGRA8Unorm_sRGB:
+		return 4;
+	default:
+		return 0;
+	}
+}
+
+// CPU writes made under an IOSurface lock are what the GPU reads, and GPU writes are what the
+// CPU sees under the next lock once the command buffer that made them has completed. Where
+// IOSurface exports the plane as a DMA-BUF and the device imports it, the texture uses the
+// plane's memory itself. Otherwise (the host or its driver cannot share memory that way, or it
+// was turned off) the texture holds a copy, which MTLIOSurfaceCopy keeps in step with the
+// plane: uploaded before GPU use after CPU writes, and written back on lock.
+- (id<MTLTexture>)newTextureWithDescriptor: (MTLTextureDescriptor*)descriptor
+                                 iosurface: (IOSurfaceRef)iosurface
+                                     plane: (NSUInteger)plane
+{
+	if (descriptor == nil || iosurface == NULL) {
+		return nil;
+	}
+	if (descriptor.textureType != MTLTextureType2D || descriptor.mipmapLevelCount != 1 ||
+	    descriptor.sampleCount != 1 || descriptor.arrayLength != 1 || descriptor.depth != 1) {
+		return nil;
+	}
+
+	// A surface without planes has its single plane at index 0.
+	size_t planeCount = IOSurfaceGetPlaneCount(iosurface);
+	if (plane >= (planeCount == 0 ? 1 : planeCount)) {
+		return nil;
+	}
+
+	size_t pixelSize = iosurfacePixelSize(descriptor.pixelFormat);
+	if (pixelSize == 0 || IOSurfaceGetBytesPerElementOfPlane(iosurface, plane) != pixelSize ||
+	    descriptor.width == 0 || descriptor.height == 0 ||
+	    descriptor.width > IOSurfaceGetWidthOfPlane(iosurface, plane) ||
+	    descriptor.height > IOSurfaceGetHeightOfPlane(iosurface, plane)) {
+		return nil;
+	}
+
+	std::shared_ptr<Indium::Texture> texture;
+	_IOSurfaceDMABuf buffer {};
+	buffer.version = _IOSURFACE_DMABUF_VERSION;
+	if (_device->supportsDMABufImport() && _IOSurfaceGetDMABuf(iosurface, plane, &buffer)) {
+		texture = _device->newTextureWithDMABuf([descriptor asIndiumDescriptor], buffer.fd, buffer.offset, buffer.bytesPerRow);
+	}
+
+	MTLIOSurfaceCopy* copy = nullptr;
+	if (!texture) {
+		// The copy is read and written by the CPU, so it lives in host-visible memory whatever
+		// storage mode the descriptor asks for.
+		auto indiumDescriptor = [descriptor asIndiumDescriptor];
+		constexpr size_t storageModeBits = 0xf << 4;
+		indiumDescriptor.resourceOptions = static_cast<Indium::ResourceOptions>(
+			static_cast<size_t>(indiumDescriptor.resourceOptions) & ~storageModeBits);
+		try {
+			texture = _device->newTexture(indiumDescriptor);
+		} catch (const std::exception&) {
+			return nil;
+		}
+		copy = texture ? MTLIOSurfaceCopyCreate(texture, iosurface, plane) : nullptr;
+		if (copy == nullptr) {
+			return nil;
+		}
+	}
+	return [[MTLTextureInternal alloc] initWithTexture: texture
+	                                            device: self
+	                                   resourceOptions: descriptor.resourceOptions
+	                                         iosurface: iosurface
+	                                             plane: plane
+	                                              copy: copy];
 }
 
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor: (MTLSamplerDescriptor*)descriptor
@@ -318,25 +702,43 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 	return [[MTLDepthStencilStateInternal alloc] initWithState: state device: self];
 }
 
-- (id<MTLCommandBuffer>)newCommandBuffer
+- (id<MTLEvent>)newEvent
 {
-	// Metal apps call this before encoding any frame, so it cannot be left
-	// unimplemented: without it no Metal work can be submitted at all. Keep one
-	// implicit queue and hand out buffers from it, rather than making every call
-	// create a fresh queue.
-	return [[self implicitCommandQueue] commandBuffer];
+	auto event = _device->newEvent();
+	if (!event) {
+		return nil;
+	}
+	return [[MTLEventInternal alloc] initWithEvent: event device: self];
 }
 
-- (id<MTLCommandQueue>)implicitCommandQueue
+- (id<MTLSharedEvent>)newSharedEvent
 {
-	if (!_implicitQueue) {
-		auto queue = _device->newCommandQueue();
-		if (!queue) {
-			return nil;
-		}
-		_implicitQueue = [[MTLCommandQueueInternal alloc] initWithQueue: queue device: self];
+	auto event = _device->newSharedEvent();
+	if (!event) {
+		return nil;
 	}
-	return _implicitQueue;
+	return [[MTLSharedEventInternal alloc] initWithEvent: event device: self];
+}
+
+- (id<MTLSharedEvent>)newSharedEventWithHandle: (MTLSharedEventHandle*)sharedEventHandle
+{
+	if (!sharedEventHandle) {
+		return nil;
+	}
+	auto event = _device->newSharedEvent([sharedEventHandle indiumHandle]);
+	if (!event) {
+		return nil;
+	}
+	return [[MTLSharedEventInternal alloc] initWithEvent: event device: self];
+}
+
+- (id<MTLFence>)newFence
+{
+	auto fence = _device->newFence();
+	if (!fence) {
+		return nil;
+	}
+	return [[MTLFenceInternal alloc] initWithFence: fence device: self];
 }
 
 - (id<MTLCommandQueue>)newCommandQueue
@@ -346,6 +748,87 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 		return nil;
 	}
 	return [[MTLCommandQueueInternal alloc] initWithQueue: queue device: self];
+}
+
+- (BOOL)macroNameIsIdentifier: (NSString*)name
+{
+	NSCharacterSet* first = [NSCharacterSet characterSetWithCharactersInString: @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"];
+	NSCharacterSet* rest = [NSCharacterSet characterSetWithCharactersInString: @"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789"];
+	if ([name length] == 0 || ![first characterIsMember: [name characterAtIndex: 0]]) {
+		return NO;
+	}
+	for (NSUInteger i = 1; i < [name length]; i++) {
+		if (![rest characterIsMember: [name characterAtIndex: i]]) {
+			return NO;
+		}
+	}
+	return YES;
+}
+
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat: (MTLPixelFormat)format
+{
+	return _device->minimumLinearTextureAlignment(static_cast<Indium::PixelFormat>(format));
+}
+
+- (void)sampleTimestamps: (MTLTimestamp*)cpuTimestamp
+            gpuTimestamp: (MTLTimestamp*)gpuTimestamp
+{
+	// indium has no device timestamps to correlate with the host clock, and no way to ask for any; the
+	// monotonic nanosecond clock of the host stands in for both, which is also what the timestamps of the
+	// command buffers are measured against.
+	static mach_timebase_info_data_t timebase;
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		mach_timebase_info(&timebase);
+	});
+	uint64_t now = mach_absolute_time() * timebase.numer / timebase.denom;
+	if (cpuTimestamp != NULL) {
+		*cpuTimestamp = now;
+	}
+	if (gpuTimestamp != NULL) {
+		*gpuTimestamp = now;
+	}
+}
+
+- (id<MTLHeap>)newHeapWithDescriptor: (MTLHeapDescriptor*)descriptor
+{
+	if (descriptor == nil) {
+		return nil;
+	}
+	Indium::HeapDescriptor indiumDescriptor;
+	indiumDescriptor.size = descriptor.size;
+	indiumDescriptor.storageMode = static_cast<Indium::StorageMode>(descriptor.storageMode);
+	indiumDescriptor.cpuCacheMode = static_cast<Indium::CPUCacheMode>(descriptor.cpuCacheMode);
+	indiumDescriptor.hazardTrackingMode = static_cast<Indium::HazardTrackingMode>(descriptor.hazardTrackingMode);
+	indiumDescriptor.type = static_cast<Indium::HeapType>(descriptor.type);
+
+	// indium refuses (nil) a heap it cannot make: sparse, a storage mode other than shared and private, no
+	// size, or memory the device cannot allocate
+	try {
+		auto heap = _device->newHeap(indiumDescriptor);
+		if (!heap) {
+			return nil;
+		}
+		return [[MTLHeapInternal alloc] initWithHeap: heap device: self];
+	} catch (const std::exception&) {
+		return nil;
+	}
+}
+
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength: (NSUInteger)length
+                                            options: (MTLResourceOptions)options
+{
+	auto sizeAndAlign = _device->heapBufferSizeAndAlign(length, static_cast<Indium::ResourceOptions>(options));
+	return MTLSizeAndAlign { sizeAndAlign.size, sizeAndAlign.align };
+}
+
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor: (MTLTextureDescriptor*)desc
+{
+	if (desc == nil) {
+		return MTLSizeAndAlign { 0, 0 };
+	}
+	auto sizeAndAlign = _device->heapTextureSizeAndAlign([desc asIndiumDescriptor]);
+	return MTLSizeAndAlign { sizeAndAlign.size, sizeAndAlign.align };
 }
 
 - (id<MTLBuffer>)newBufferWithLength: (NSUInteger)length
@@ -380,8 +863,7 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 	NSURL* url = [bundle URLForResource: @"default" withExtension: @"metallib"];
 	if (url == nil) {
 		if (error) {
-			// TODO: better error
-			*error = [NSError errorWithDomain: NSPOSIXErrorDomain code: ENOENT userInfo: nil];
+			*error = MTLErrorWithCode(MTLLibraryErrorFileNotFound, @"The bundle has no default.metallib");
 		}
 		return nil;
 	}
@@ -396,40 +878,42 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 		// error was already written
 		return nil;
 	}
-	auto lib = _device->newLibrary(data.bytes, data.length);
-	if (!lib) {
-		return nil;
-	}
-	return [[MTLLibraryInternal alloc] initWithLibrary: lib device: self];
+	return [self newLibraryWithBytes: data.bytes length: data.length error: error];
 }
 
 - (id<MTLLibrary>)newLibraryWithData: (dispatch_data_t)data
                                error: (NSError**)error
 {
-	NSData* nsdata = (NSData*)data;
-	if (nsdata == nil || [nsdata length] == 0) {
-		if (error) {
-			*error = [NSError errorWithDomain: MTLLibraryErrorDomain code: MTLLibraryErrorCompileFailure userInfo: nil];
+	if (!data) {
+		MTLSetError(error, MTLLibraryErrorInternal, @"No library data");
+		return nil;
+	}
+	// a dispatch_data_t may be made of several regions; map it to one contiguous buffer
+	const void* bytes = nullptr;
+	size_t length = 0;
+	dispatch_data_t contiguous = dispatch_data_create_map(data, &bytes, &length);
+	id<MTLLibrary> library = [self newLibraryWithBytes: bytes length: length error: error];
+	dispatch_release(contiguous);
+	return library;
+}
+
+- (id<MTLLibrary>)newLibraryWithBytes: (const void*)bytes
+                               length: (size_t)length
+                                error: (NSError**)error
+{
+	if (error) {
+		*error = nil;
+	}
+	auto lib = MTLCallIndium(error, MTLLibraryErrorCompileFailure, [&]() {
+		return _device->newLibrary(bytes, length);
+	});
+	if (!lib) {
+		if (error && !*error) {
+			*error = MTLErrorWithCode(MTLLibraryErrorCompileFailure, @"The library could not be translated");
 		}
 		return nil;
 	}
-	try {
-		auto lib = _device->newLibrary(nsdata.bytes, nsdata.length);
-		if (!lib) {
-			if (error) {
-				*error = [NSError errorWithDomain: MTLLibraryErrorDomain code: MTLLibraryErrorCompileFailure userInfo: nil];
-			}
-			return nil;
-		}
-		return [[MTLLibraryInternal alloc] initWithLibrary: lib device: self];
-	} catch (const std::exception& e) {
-		if (error) {
-			*error = [NSError errorWithDomain: MTLLibraryErrorDomain code: MTLLibraryErrorCompileFailure userInfo: @{
-				NSLocalizedDescriptionKey: [NSString stringWithUTF8String: e.what()]
-			}];
-		}
-		return nil;
-	}
+	return [[MTLLibraryInternal alloc] initWithLibrary: lib device: self];
 }
 
 - (id<MTLLibrary>)newLibraryWithSource: (NSString*)source
@@ -458,24 +942,72 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 		return nil;
 	}
 
-	MslcOptions mslcOptions;
-	mslc_default_options(&mslcOptions);
+	const MslcApi* mslc = LoadMslc();
+	if (mslc == nullptr) {
+		if (error) {
+			*error = MSLLibraryError(@"compiling Metal Shading Language source is not supported in this process",
+				MTLLibraryErrorUnsupported);
+		}
+		return nil;
+	}
 
-	// `options` is accepted and not read, because this framework's
-	// MTLCompileOptions declares no properties: an options object here carries no
-	// state, so it cannot change the output and nothing is being dropped. That is
-	// not true of Apple's class, which has fastMathEnabled, languageVersion and
-	// libraryPath. When those are added here, the ones mslc cannot honour have to
-	// be refused rather than ignored, in this method and nowhere else: an app that
-	// asks for a language version it does not get must get an error, not a library
+	MslcOptions mslcOptions;
+	mslc->default_options(&mslcOptions);
+
+	// dispatchThreads: can be given a grid that is not a multiple of the threadgroup size at any time, so the
+	// kernels skip the threads beyond the grid size when they can
+	mslcOptions.maskGridSize = 1;
+
+	// The preprocessor macros of `options` are defined before the source, as -D would on a compiler's command
+	// line. Its other properties (math mode, language version, library type and so on) are not read yet. The
+	// ones mslc cannot honour have to be refused rather than ignored when they are added, in this method
+	// and nowhere else: an app that asks for a language version it does not get must get an error, not a library
 	// compiled at a different version than it asked for.
+	NSMutableArray<NSString*>* macroNameStrings = [NSMutableArray array];
+	NSMutableArray<NSString*>* macroValueStrings = [NSMutableArray array];
+	NSDictionary* macros = options.preprocessorMacros;
+	// in key order, so the same options always make the same library
+	for (id key in [macros.allKeys sortedArrayUsingSelector: @selector(compare:)]) {
+		id value = macros[key];
+		NSString* text = nil;
+		if ([value isKindOfClass: [NSString class]]) {
+			text = value;
+		} else if ([value isKindOfClass: [NSNumber class]]) {
+			text = [(NSNumber*)value stringValue];
+		}
+		if (![key isKindOfClass: [NSString class]] || text == nil) {
+			if (error) {
+				*error = MSLLibraryError(@"preprocessorMacros has a key that is not a string or a value that is neither a string nor a number",
+					MTLLibraryErrorCompileFailure);
+			}
+			return nil;
+		}
+		// Any name is accepted, as the Metal compiler does with -D: one that is not an identifier (or that mslc's
+		// preprocessor cannot define) defines nothing a source could use, so it is dropped instead of failing.
+		if (![self macroNameIsIdentifier: key]) {
+			continue;
+		}
+		[macroNameStrings addObject: key];
+		[macroValueStrings addObject: text];
+	}
+	std::vector<const char*> macroNames;
+	std::vector<const char*> macroValues;
+	for (NSUInteger i = 0; i < macroNameStrings.count; i++) {
+		macroNames.push_back([macroNameStrings[i] UTF8String]);
+		macroValues.push_back([macroValueStrings[i] UTF8String]);
+	}
+	if (!macroNames.empty()) {
+		mslcOptions.macroNames = macroNames.data();
+		mslcOptions.macroValues = macroValues.data();
+		mslcOptions.macroCount = macroNames.size();
+	}
 
 	uint8_t* spirv = NULL;
 	size_t spirvSize = 0;
 	char* reflection = NULL;
 	char* diagnostic = NULL;
 
-	int translated = mslc_translate(
+	int translated = mslc->translate(
 		static_cast<const char*>([utf8 bytes]), [utf8 length], &mslcOptions,
 		&spirv, &spirvSize, &reflection, &diagnostic);
 
@@ -490,9 +1022,9 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 				MTLLibraryErrorCompileFailure);
 		}
 
-		mslc_free(spirv);
-		mslc_free(reflection);
-		mslc_free(diagnostic);
+		mslc->free_buffer(spirv);
+		mslc->free_buffer(reflection);
+		mslc->free_buffer(diagnostic);
 		return nil;
 	}
 
@@ -510,9 +1042,9 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 				MTLLibraryErrorUnsupported);
 		}
 
-		mslc_free(spirv);
-		mslc_free(reflection);
-		mslc_free(diagnostic);
+		mslc->free_buffer(spirv);
+		mslc->free_buffer(reflection);
+		mslc->free_buffer(diagnostic);
 		return nil;
 	}
 
@@ -522,9 +1054,9 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 	// indium borrows the module and the reflection for the call and nothing
 	// longer, so both go back before the library is handed out rather than after
 	// it is used.
-	mslc_free(spirv);
-	mslc_free(reflection);
-	mslc_free(diagnostic);
+	mslc->free_buffer(spirv);
+	mslc->free_buffer(reflection);
+	mslc->free_buffer(diagnostic);
 
 	if (!library) {
 		if (error) {
@@ -539,47 +1071,10 @@ void MTLRemoveDeviceObserver(id<NSObject> observer) {
 	return [[MTLLibraryInternal alloc] initWithLibrary: library device: self];
 }
 
-- (BOOL) isLowPower {
-	return NO;
-}
-
-- (BOOL) isHeadless {
-	return NO;
-}
-
-- (BOOL) isRemovable {
-	return NO;
-}
-
 #else
 
 MTL_UNSUPPORTED_CLASS
 
 #endif
-
-- (BOOL) supportsFamily: (MTLGPUFamily)family {
-	// See the note in MTLDevice.h. indium cannot report a GPU family, so this
-	// answers for the Apple Silicon generation this was verified against and
-	// declines every other. Declining is the safe direction: a caller that
-	// believes it is on a family we do not claim will pick a path indium may not
-	// be able to run, while a caller told NO takes the conservative one.
-	return family == MTLGPUFamilyApple1;
-}
-
-- (BOOL) supportsShaderBarycentricCoordinates {
-	// See the note in MTLDevice.h: Vulkan has no barycentric decoration to lower
-	// onto, so this says what the backend implements.
-	return NO;
-}
-
-- (MTLArgumentBuffersTier) argumentBuffersSupport {
-	return MTLArgumentBuffersTier1;
-}
-
-- (BOOL) supportsTextureSampleCount: (NSUInteger)count {
-	/* MSL only supports a single sample per pixel; no multisampling is implemented
-	 * here, so anything other than 1 is refused rather than silently wrong. */
-	return count == 1;
-}
 
 @end

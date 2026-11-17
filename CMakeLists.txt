@@ -15,34 +15,28 @@ if (BUILD_METAL)
 	# -[MTLDevice newLibraryWithSource:options:error:] has a front end to call.
 	#
 	# mslc's own CMakeLists.txt is deliberately not used. It builds a CLI driver
-	# and a corpus runner that fork/exec spirv-val, neither of which belongs in a
-	# guest address space with no host exec path, and mslc is a repository other
-	# people work on, so a target appearing there must not become a reason this
-	# one stops building. The six sources below are the whole library; main.cpp is
-	# the driver.
+	# and test programs, none of which belong in the guest, so the library
+	# sources and include directories come from the sources.cmake that mslc
+	# provides for embedders; the list therefore always matches the pinned
+	# revision.
 	#
 	# The public surface is a C ABI declared in deps/mslc/include/mslc/mslc.h, which
 	# is what Metal.framework includes. No C++ of mslc's is visible past it.
 	#
+	include(deps/mslc/sources.cmake)
 	set(DYLIB_INSTALL_NAME "/usr/lib/darling/libmslc.dylib")
-	add_darling_library(mslc
-		deps/mslc/src/lexer.cpp
-		deps/mslc/src/ast.cpp
-		deps/mslc/src/parser.cpp
-		deps/mslc/src/sema.cpp
-		deps/mslc/src/spirv.cpp
-		deps/mslc/src/mslc.cpp
-	)
-	make_fat(mslc)
+	# 64-bit only: mslc uses 128-bit integers, which the 32-bit slice cannot compile. Metal loads
+	# the library when source is compiled instead of linking it, so its 32-bit slice does not
+	# need it (see MTLDevice.mm).
+	set(DARLING_LIB_64BIT_ONLY TRUE)
+	add_darling_library(mslc ${MSLC_LIBRARY_SOURCES})
+	set(DARLING_LIB_64BIT_ONLY FALSE)
 
 	install(TARGETS mslc DESTINATION libexec/darling/usr/lib/darling)
 
-	target_include_directories(mslc PUBLIC
-		deps/mslc/include
-	)
-
-	target_include_directories(mslc PRIVATE
-		deps/mslc/src
+	target_include_directories(mslc
+		PUBLIC ${MSLC_PUBLIC_INCLUDE_DIRS}
+		PRIVATE ${MSLC_PRIVATE_INCLUDE_DIRS}
 	)
 
 	set_target_properties(mslc PROPERTIES
@@ -73,7 +67,7 @@ generate_sdk_framework(Metal
 
 if (BUILD_METAL)
 	set(METAL_LINK_INDIUM indium)
-	set(METAL_LINK_MSLC mslc)
+	set(METAL_LINK_MSLC "")
 else()
 	set(METAL_LINK_INDIUM "")
 	set(METAL_LINK_MSLC "")
@@ -91,6 +85,7 @@ add_framework(Metal
 		src/Metal/MTLAccelerationStructure.mm
 		src/Metal/MTLAccelerationStructureDescriptor.mm
 		src/Metal/MTLAccelerationStructureGeometryDescriptor.mm
+		src/Metal/MTLArgument.mm
 		src/Metal/MTLArgumentDescriptor.mm
 		src/Metal/MTLBinaryArchive.mm
 		src/Metal/MTLBlitCommandEncoder.mm
@@ -106,13 +101,16 @@ add_framework(Metal
 		src/Metal/MTLDepthStencilDescriptor.mm
 		src/Metal/MTLDevice.mm
 		src/Metal/MTLDrawable.mm
+		src/Metal/MTLEvent.mm
+		src/Metal/MTLFence.mm
 		src/Metal/MTLFunctionConstantValues.mm
 		src/Metal/MTLHeap.mm
 		src/Metal/MTLIndirectCommandBuffer.mm
 		src/Metal/MTLIntersectionFunctionTable.mm
+		src/Metal/MTLIOSurfaceCopy.mm
 		src/Metal/MTLLibrary.mm
-		src/Metal/MTLMSLReflection.mm
 		src/Metal/MTLLinkedFunctions.mm
+		src/Metal/MTLMSLReflection.mm
 		src/Metal/MTLPipeline.mm
 		src/Metal/MTLRenderCommandEncoder.mm
 		src/Metal/MTLRenderPipeline.mm
@@ -130,6 +128,7 @@ add_framework(Metal
 		system
 		objc
 		Foundation
+		IOSurface
 		${METAL_LINK_INDIUM}
 		${METAL_LINK_MSLC}
 		cxx
@@ -178,6 +177,11 @@ generate_sdk_framework(MetalKit
 	VERSION ${FRAMEWORK_VERSION}
 	HEADER "include/MetalKit"
 )
+
+if (BUILD_METAL)
+	add_dependencies(Metal mslc)
+	target_include_directories(Metal PRIVATE ${MSLC_PUBLIC_INCLUDE_DIRS})
+endif()
 
 add_framework(MetalKit
 	FAT

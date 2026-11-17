@@ -7,15 +7,23 @@
 #import <Metal/MTLCommandEncoder.h>
 #import <Metal/MTLComputePipeline.h>
 #import <Metal/MTLDefines.h>
+#import <Metal/MTLFence.h>
 #import <Metal/MTLTypes.h>
 
 METAL_DECLARATIONS_BEGIN
+
+// The arguments an indirect dispatch reads from its buffer: the grid size in threadgroups.
+typedef struct {
+	uint32_t threadgroupsPerGrid[3];
+} MTLDispatchThreadgroupsIndirectArguments;
 
 @protocol MTLComputeCommandEncoder;
 @protocol MTLCounterSampleBuffer;
 @protocol MTLBuffer;
 @protocol MTLSamplerState;
 @protocol MTLTexture;
+@protocol MTLResource;
+@protocol MTLHeap;
 
 @class MTLComputePassDescriptor;
 @class MTLComputePassSampleBufferAttachmentDescriptorArray;
@@ -53,6 +61,10 @@ MTL_EXPORT
 @end
 
 @protocol MTLComputeCommandEncoder <MTLCommandEncoder>
+
+/* See MTLBlitCommandEncoder. */
+- (void)updateFence: (id<MTLFence>)fence;
+- (void)waitForFence: (id<MTLFence>)fence;
 
 @property(readonly) MTLDispatchType dispatchType;
 
@@ -105,6 +117,21 @@ MTL_EXPORT
 
 - (void)dispatchThreads: (MTLSize)threadsPerGrid 
   threadsPerThreadgroup: (MTLSize)threadsPerThreadgroup;
+
+- (void)dispatchThreadgroupsWithIndirectBuffer: (id<MTLBuffer>)indirectBuffer
+                          indirectBufferOffset: (NSUInteger)indirectBufferOffset
+                         threadsPerThreadgroup: (MTLSize)threadsPerThreadgroup;
+
+// Residency hints: the resources the commands that follow use through an argument buffer or a heap. Every
+// resource is resident here, so these change nothing.
+- (void)useResource: (id<MTLResource>)resource
+              usage: (MTLResourceUsage)usage;
+- (void)useResources: (const id<MTLResource> __nonnull [__nonnull])resources
+               count: (NSUInteger)count
+               usage: (MTLResourceUsage)usage;
+- (void)useHeap: (id<MTLHeap>)heap;
+- (void)useHeaps: (const id<MTLHeap> __nonnull [__nonnull])heaps
+           count: (NSUInteger)count;
 
 @end
 

@@ -7,6 +7,7 @@
 #import <Foundation/Foundation.h>
 
 #import <Metal/MTLDefines.h>
+#import <Metal/MTLArgumentDescriptor.h>
 
 METAL_DECLARATIONS_BEGIN
 
@@ -18,6 +19,7 @@ METAL_DECLARATIONS_BEGIN
 @class MTLVertexAttribute;
 @class MTLAttribute;
 @class MTLFunctionConstant;
+@class MTLFunctionConstantValues;
 @class MTLArgument;
 
 typedef __autoreleasing MTLArgument* MTLAutoreleasedArgument;
@@ -43,7 +45,7 @@ typedef NS_ENUM(NSUInteger, MTLPatchType) {
 	MTLPatchTypeQuad = 2,
 };
 
-typedef NS_ENUM(NSUInteger, MTLLibraryType) {
+typedef NS_ENUM(NSInteger, MTLLibraryType) {
 	MTLLibraryTypeExecutable = 0,
 	MTLLibraryTypeDynamic = 1,
 };
@@ -59,6 +61,59 @@ typedef NS_ENUM(NSUInteger, MTLLibraryError) {
 	MTLLibraryErrorFileNotFound = 6,
 };
 
+/* A function constant ([[function_constant(n)]]) a function uses. `required` is always YES: the shader
+ * compiler's output does not say whether a constant has a default. */
+@interface MTLFunctionConstant : NSObject {
+@private
+	NSString* _name;
+	MTLDataType _type;
+	NSUInteger _index;
+}
+
+@property(readonly) NSString* name;
+@property(readonly) MTLDataType type;
+@property(readonly) NSUInteger index;
+@property(readonly) BOOL required;
+
+@end
+
+/* One input of a vertex function, as declared with [[attribute(n)]]. */
+@interface MTLVertexAttribute : NSObject {
+@private
+	NSString* _name;
+	NSUInteger _attributeIndex;
+	MTLDataType _attributeType;
+}
+
+@property(readonly) NSString* name;
+@property(readonly) NSUInteger attributeIndex;
+@property(readonly) MTLDataType attributeType;
+/* Always YES: indium does not track whether the function reads an input. */
+@property(readonly, getter=isActive) BOOL active;
+@property(readonly, getter=isPatchData) BOOL patchData;
+@property(readonly, getter=isPatchControlPointData) BOOL patchControlPointData;
+
+@end
+
+/* One stage input of a function, as declared with [[stage_in]]. Only a vertex function's inputs are
+ * reflected. */
+@interface MTLAttribute : NSObject {
+@private
+	NSString* _name;
+	NSUInteger _attributeIndex;
+	MTLDataType _attributeType;
+}
+
+@property(readonly) NSString* name;
+@property(readonly) NSUInteger attributeIndex;
+@property(readonly) MTLDataType attributeType;
+/* Always YES: indium does not track whether the function reads an input. */
+@property(readonly, getter=isActive) BOOL active;
+@property(readonly, getter=isPatchData) BOOL patchData;
+@property(readonly, getter=isPatchControlPointData) BOOL patchControlPointData;
+
+@end
+
 @protocol MTLFunction <NSObject>
 
 @property(readonly) id<MTLDevice> device;
@@ -67,8 +122,10 @@ typedef NS_ENUM(NSUInteger, MTLLibraryError) {
 @property(readonly) MTLFunctionOptions options;
 @property(readonly) MTLPatchType patchType;
 @property(readonly) NSInteger patchControlPointCount;
-@property(readonly) NSArray<MTLVertexAttribute*>* vertexAttributes;
-@property(readonly) NSArray<MTLAttribute*>* stageInputAttributes;
+/* The inputs of a vertex function, in the order the shader declares them; nil for other functions. */
+@property(nullable, readonly) NSArray<MTLVertexAttribute*>* vertexAttributes;
+/* The same inputs as MTLAttribute objects; nil for other functions, whose stage inputs are not reflected. */
+@property(nullable, readonly) NSArray<MTLAttribute*>* stageInputAttributes;
 @property(readonly) NSDictionary<NSString*, MTLFunctionConstant*>* functionConstantsDictionary;
 @property(nullable, copy, nonatomic) NSString* label;
 
@@ -88,6 +145,17 @@ typedef NS_ENUM(NSUInteger, MTLLibraryError) {
 @property(nullable, copy, nonatomic) NSString* label;
 
 - (id<MTLFunction>)newFunctionWithName: (NSString*)functionName;
+
+/* Only bool, int, uint and float constants can be given values. Values for constants the function does
+ * not use are ignored. nil with MTLLibraryErrorFunctionNotFound when there is no such function, and with
+ * MTLLibraryErrorCompileFailure when a value has another type than its constant. */
+- (id<MTLFunction>)newFunctionWithName: (NSString*)name
+                        constantValues: (MTLFunctionConstantValues*)constantValues
+                                 error: (NSError**)error;
+
+- (void)newFunctionWithName: (NSString*)name
+             constantValues: (MTLFunctionConstantValues*)constantValues
+          completionHandler: (void (^)(id<MTLFunction> function, NSError* error))completionHandler;
 
 // TODO: other methods
 

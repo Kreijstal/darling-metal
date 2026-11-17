@@ -5,6 +5,7 @@
 #define _METAL_MTLRENDERCOMMANDENCODER_H_
 
 #import <Metal/MTLDefines.h>
+#import <Metal/MTLFence.h>
 #import <Foundation/Foundation.h>
 #import <Metal/MTLCommandEncoder.h>
 #import <Metal/MTLRenderPipeline.h>
@@ -12,11 +13,29 @@
 METAL_DECLARATIONS_BEGIN
 
 @protocol MTLBuffer;
+@protocol MTLResource;
+@protocol MTLHeap;
 @protocol MTLDepthStencilState;
 @protocol MTLRasterizationRateMap;
 @protocol MTLSamplerState;
 @protocol MTLTexture;
 @protocol MTLRenderPipelineState;
+
+// The arguments an indirect draw reads from its buffer.
+typedef struct {
+	uint32_t vertexCount;
+	uint32_t instanceCount;
+	uint32_t vertexStart;
+	uint32_t baseInstance;
+} MTLDrawPrimitivesIndirectArguments;
+
+typedef struct {
+	uint32_t indexCount;
+	uint32_t instanceCount;
+	uint32_t indexStart;
+	int32_t baseVertex;
+	uint32_t baseInstance;
+} MTLDrawIndexedPrimitivesIndirectArguments;
 
 @class MTLRenderPassColorAttachmentDescriptorArray;
 @class MTLRenderPassDepthAttachmentDescriptor;
@@ -27,6 +46,14 @@ METAL_DECLARATIONS_BEGIN
 
 struct MTLSamplePosition;
 typedef struct MTLSamplePosition MTLSamplePosition;
+
+typedef NS_OPTIONS(NSUInteger, MTLRenderStages) {
+	MTLRenderStageVertex = 1 << 0,
+	MTLRenderStageFragment = 1 << 1,
+	MTLRenderStageTile = 1 << 2,
+	MTLRenderStageObject = 1 << 3,
+	MTLRenderStageMesh = 1 << 4,
+};
 
 typedef NS_ENUM(NSUInteger, MTLLoadAction) {
 	MTLLoadActionDontCare = 0,
@@ -111,10 +138,10 @@ typedef struct MTLViewport {
 } MTLViewport;
 
 typedef struct MTLScissorRect {
-	size_t height;
-	size_t width;
-	size_t x;
-	size_t y;
+	NSUInteger x;
+	NSUInteger y;
+	NSUInteger width;
+	NSUInteger height;
 } MTLScissorRect;
 
 NS_INLINE
@@ -223,6 +250,17 @@ MTL_EXPORT
           slopeScale: (float)slopeScale
                clamp: (float)clamp;
 - (void)setDepthStencilState: (id<MTLDepthStencilState>)state;
+- (void)memoryBarrierWithScope: (MTLBarrierScope)scope
+                   afterStages: (MTLRenderStages)after
+                  beforeStages: (MTLRenderStages)before;
+
+/* Updates `fence` once the work of the `stages` of the commands encoded so far has finished. */
+- (void)updateFence: (id<MTLFence>)fence
+        afterStages: (MTLRenderStages)stages;
+
+/* Holds the `stages` of the commands encoded after this call back until the work the fence was updated after in earlier encoders has finished. */
+- (void)waitForFence: (id<MTLFence>)fence
+        beforeStages: (MTLRenderStages)stages;
 - (void)setVisibilityResultMode: (MTLVisibilityResultMode)mode
                           offset: (NSUInteger)offset;
 
@@ -326,6 +364,40 @@ MTL_EXPORT
                     indexType: (MTLIndexType)indexType
                   indexBuffer: (id<MTLBuffer>)indexBuffer
             indexBufferOffset: (NSUInteger)indexBufferOffset;
+
+- (void)drawPrimitives: (MTLPrimitiveType)primitiveType
+         indirectBuffer: (id<MTLBuffer>)indirectBuffer
+   indirectBufferOffset: (NSUInteger)indirectBufferOffset;
+
+- (void)drawIndexedPrimitives: (MTLPrimitiveType)primitiveType
+                    indexType: (MTLIndexType)indexType
+                  indexBuffer: (id<MTLBuffer>)indexBuffer
+            indexBufferOffset: (NSUInteger)indexBufferOffset
+               indirectBuffer: (id<MTLBuffer>)indirectBuffer
+         indirectBufferOffset: (NSUInteger)indirectBufferOffset;
+
+// Residency hints: the resources the draws that follow use through an argument buffer or a heap. Every
+// resource is resident here, so these change nothing.
+- (void)useResource: (id<MTLResource>)resource
+              usage: (MTLResourceUsage)usage;
+- (void)useResources: (const id<MTLResource> __nonnull [__nonnull])resources
+               count: (NSUInteger)count
+               usage: (MTLResourceUsage)usage;
+- (void)useResource: (id<MTLResource>)resource
+              usage: (MTLResourceUsage)usage
+             stages: (MTLRenderStages)stages;
+- (void)useResources: (const id<MTLResource> __nonnull [__nonnull])resources
+               count: (NSUInteger)count
+               usage: (MTLResourceUsage)usage
+              stages: (MTLRenderStages)stages;
+- (void)useHeap: (id<MTLHeap>)heap;
+- (void)useHeaps: (const id<MTLHeap> __nonnull [__nonnull])heaps
+           count: (NSUInteger)count;
+- (void)useHeap: (id<MTLHeap>)heap
+         stages: (MTLRenderStages)stages;
+- (void)useHeaps: (const id<MTLHeap> __nonnull [__nonnull])heaps
+           count: (NSUInteger)count
+          stages: (MTLRenderStages)stages;
 
 @end
 

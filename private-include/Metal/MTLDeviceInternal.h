@@ -21,11 +21,17 @@ void MTLDeviceDestroyAll(void);
 
 - (void)stopPolling;
 
+// the platform identity settings that override what the device reports
+- (void)setReportedName: (NSString*)name;
+- (void)setReportedWorkingSetSize: (uint64_t)size;
+- (void)setReportedUnifiedMemory: (BOOL)unifiedMemory;
+
 - (void)waitUntilPollingIsStopped;
 
-// Implicit queue backing -[MTLDevice newCommandBuffer]. Metal apps call that
-// before every frame and rarely ever ask for an explicit queue.
-- (id<MTLCommandQueue>)implicitCommandQueue;
+// creates a library from a metallib in memory, reporting failures in `error`
+- (id<MTLLibrary>)newLibraryWithBytes: (const void*)bytes
+                               length: (size_t)length
+                                error: (NSError**)error;
 #endif
 
 @end

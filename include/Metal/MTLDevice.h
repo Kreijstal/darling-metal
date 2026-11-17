@@ -5,38 +5,21 @@
 #define _METAL_MTLDEVICE_H_
 
 #import <Foundation/Foundation.h>
+#import <IOSurface/IOSurfaceRef.h>
 
 #import <Metal/MTLResource.h>
+#import <Metal/MTLPixelFormat.h>
 #import <Metal/MTLDefines.h>
+#import <Metal/MTLEvent.h>
+#import <Metal/MTLFence.h>
 
 METAL_DECLARATIONS_BEGIN
-typedef NS_ENUM(NSUInteger, MTLArgumentBuffersTier) {
-	MTLArgumentBuffersTier1 = 0,
-	MTLArgumentBuffersTier2 = 1,
-};
 
-// MTLGPUFamily is Apple's own numbering of GPU silicon generations. Darling's SDK
-// subset does not carry the enum, but a caller passes these values from its own
-// Metal headers, so only the one value we compare against is load-bearing: every
-// other family is declined regardless of what it is called.
-typedef NS_ENUM(NSInteger, MTLGPUFamily) {
-	MTLGPUFamilyApple1       = 1001,
-	MTLGPUFamilyApple2       = 1002,
-	MTLGPUFamilyApple3       = 1003,
-	MTLGPUFamilyApple4       = 1004,
-	MTLGPUFamilyApple5       = 1005,
-	MTLGPUFamilyApple6       = 1006,
-	MTLGPUFamilyApple7       = 1007,
-	MTLGPUFamilyMac1         = 2001,
-	MTLGPUFamilyMac2         = 2002,
-	MTLGPUFamilyCommon1      = 3001,
-	MTLGPUFamilyCommon2      = 3002,
-	MTLGPUFamilyCommon3      = 3003,
-	MTLGPUFamilyMetal3       = 5003,
-	MTLGPUFamilyMacCatalyst1 = 6001,
-	MTLGPUFamilyMacCatalyst2 = 6002,
-};
-
+// What a resource takes in a heap: its size, and the alignment of the offset it is placed at.
+typedef struct MTLSizeAndAlign {
+	NSUInteger size;
+	NSUInteger align;
+} MTLSizeAndAlign;
 
 @protocol MTLComputePipelineState;
 @protocol MTLFunction;
@@ -48,10 +31,14 @@ typedef NS_ENUM(NSInteger, MTLGPUFamily) {
 @protocol MTLTexture;
 @protocol MTLDepthStencilState;
 @protocol MTLSamplerState;
+@protocol MTLHeap;
+@class MTLHeapDescriptor;
+@protocol MTLCounterSet;
 
 @class MTLCompileOptions;
 @class MTLComputePipelineDescriptor;
-@class MTLAutoreleasedComputePipelineReflection;
+@class MTLComputePipelineReflection;
+@class MTLRenderPipelineReflection;
 @class MTLDepthStencilDescriptor;
 @class MTLRenderPipelineDescriptor;
 @class MTLSamplerDescriptor;
@@ -63,6 +50,16 @@ typedef NS_OPTIONS(NSUInteger, MTLPipelineOption) {
 	MTLPipelineOptionBufferTypeInfo = 1 << 1,
 	MTLPipelineOptionFailOnBinaryArchiveMiss = 1 << 2,
 };
+
+typedef NS_ENUM(NSUInteger, MTLDeviceLocation) {
+	MTLDeviceLocationBuiltIn = 0,
+	MTLDeviceLocationSlot = 1,
+	MTLDeviceLocationExternal = 2,
+	MTLDeviceLocationUnspecified = NSUIntegerMax,
+};
+
+typedef __autoreleasing MTLComputePipelineReflection* MTLAutoreleasedComputePipelineReflection;
+typedef __autoreleasing MTLRenderPipelineReflection* MTLAutoreleasedRenderPipelineReflection;
 
 typedef NSString* MTLDeviceNotificationName;
 typedef void (^MTLDeviceNotificationHandler)(id<MTLDevice> device, MTLDeviceNotificationName notifyName);
@@ -76,59 +73,139 @@ MTL_EXPORT NSArray<id<MTLDevice>>* MTLCopyAllDevices(void);
 MTL_EXPORT NSArray<id<MTLDevice>>* MTLCopyAllDevicesWithObserver(id<NSObject>* observer, MTLDeviceNotificationHandler handler);
 MTL_EXPORT void MTLRemoveDeviceObserver(id<NSObject> observer);
 
+typedef NS_ENUM(NSUInteger, MTLFeatureSet) {
+	MTLFeatureSet_iOS_GPUFamily1_v1 = 0,
+	MTLFeatureSet_iOS_GPUFamily2_v1 = 1,
+	MTLFeatureSet_iOS_GPUFamily1_v2 = 2,
+	MTLFeatureSet_iOS_GPUFamily2_v2 = 3,
+	MTLFeatureSet_iOS_GPUFamily3_v1 = 4,
+	MTLFeatureSet_iOS_GPUFamily1_v3 = 5,
+	MTLFeatureSet_iOS_GPUFamily2_v3 = 6,
+	MTLFeatureSet_iOS_GPUFamily3_v2 = 7,
+	MTLFeatureSet_iOS_GPUFamily1_v4 = 8,
+	MTLFeatureSet_iOS_GPUFamily2_v4 = 9,
+	MTLFeatureSet_iOS_GPUFamily3_v3 = 10,
+	MTLFeatureSet_iOS_GPUFamily4_v1 = 11,
+	MTLFeatureSet_iOS_GPUFamily1_v5 = 12,
+	MTLFeatureSet_iOS_GPUFamily2_v5 = 13,
+	MTLFeatureSet_iOS_GPUFamily3_v4 = 14,
+	MTLFeatureSet_iOS_GPUFamily4_v2 = 15,
+	MTLFeatureSet_iOS_GPUFamily5_v1 = 16,
+
+	MTLFeatureSet_macOS_GPUFamily1_v1 = 10000,
+	MTLFeatureSet_OSX_GPUFamily1_v1 = MTLFeatureSet_macOS_GPUFamily1_v1,
+	MTLFeatureSet_macOS_GPUFamily1_v2 = 10001,
+	MTLFeatureSet_OSX_GPUFamily1_v2 = MTLFeatureSet_macOS_GPUFamily1_v2,
+	MTLFeatureSet_macOS_ReadWriteTextureTier2 = 10002,
+	MTLFeatureSet_OSX_ReadWriteTextureTier2 = MTLFeatureSet_macOS_ReadWriteTextureTier2,
+	MTLFeatureSet_macOS_GPUFamily1_v3 = 10003,
+	MTLFeatureSet_macOS_GPUFamily1_v4 = 10004,
+	MTLFeatureSet_macOS_GPUFamily2_v1 = 10005,
+
+	MTLFeatureSet_tvOS_GPUFamily1_v1 = 30000,
+	MTLFeatureSet_TVOS_GPUFamily1_v1 = MTLFeatureSet_tvOS_GPUFamily1_v1,
+	MTLFeatureSet_tvOS_GPUFamily1_v2 = 30001,
+	MTLFeatureSet_tvOS_GPUFamily1_v3 = 30002,
+	MTLFeatureSet_tvOS_GPUFamily2_v1 = 30003,
+	MTLFeatureSet_tvOS_GPUFamily1_v4 = 30004,
+	MTLFeatureSet_tvOS_GPUFamily2_v2 = 30005,
+};
+
+typedef NS_ENUM(NSInteger, MTLGPUFamily) {
+	MTLGPUFamilyApple1 = 1001,
+	MTLGPUFamilyApple2 = 1002,
+	MTLGPUFamilyApple3 = 1003,
+	MTLGPUFamilyApple4 = 1004,
+	MTLGPUFamilyApple5 = 1005,
+	MTLGPUFamilyApple6 = 1006,
+	MTLGPUFamilyApple7 = 1007,
+	MTLGPUFamilyApple8 = 1008,
+	MTLGPUFamilyApple9 = 1009,
+	MTLGPUFamilyApple10 = 1010,
+	MTLGPUFamilyApple11 = 1011,
+
+	MTLGPUFamilyMac1 = 2001,
+	MTLGPUFamilyMac2 = 2002,
+
+	MTLGPUFamilyCommon1 = 3001,
+	MTLGPUFamilyCommon2 = 3002,
+	MTLGPUFamilyCommon3 = 3003,
+
+	MTLGPUFamilyMacCatalyst1 = 4001,
+	MTLGPUFamilyMacCatalyst2 = 4002,
+
+	MTLGPUFamilyMetal3 = 5001,
+	MTLGPUFamilyMetal4 = 5002,
+};
+
+typedef NS_ENUM(NSUInteger, MTLArgumentBuffersTier) {
+	MTLArgumentBuffersTier1 = 0,
+	MTLArgumentBuffersTier2 = 1,
+};
+
+typedef NS_ENUM(NSUInteger, MTLReadWriteTextureTier) {
+	MTLReadWriteTextureTierNone = 0,
+	MTLReadWriteTextureTier1 = 1,
+	MTLReadWriteTextureTier2 = 2,
+};
+
+typedef uint64_t MTLTimestamp;
+
 @protocol MTLDevice <NSObject>
 
-/*!
- @property recommendedMaxWorkingSetSize
- @abstract An approximation of how much memory this device can use with good
- performance. Keeping the total size of all resources and heaps below it avoids
- overcommitting the device and the performance penalty that comes with it. */
-@property(nonatomic, readonly) uint64_t recommendedMaxWorkingSetSize;
+@property(readonly, nonnull) NSString* name;
+@property(readonly) uint64_t registryID;
+@property(readonly, getter=isLowPower) BOOL lowPower;
+@property(readonly, getter=isHeadless) BOOL headless;
+@property(readonly, getter=isRemovable) BOOL removable;
+@property(readonly) BOOL hasUnifiedMemory;
+@property(readonly) uint64_t recommendedMaxWorkingSetSize;
 @property(readonly) NSUInteger maxBufferLength;
+@property(readonly, getter=isDepth24Stencil8PixelFormatSupported) BOOL depth24Stencil8PixelFormatSupported;
+@property(readonly) MTLReadWriteTextureTier readWriteTextureSupport;
 
-/*!
- @property name
- @abstract The full name of the vendor device.
- @discussion This is the device's own name, which indium reads out of
- VkPhysicalDeviceProperties::deviceName. That member is specified to be a
- null-terminated UTF-8 string, so it converts without loss and without this
- framework having to guess an encoding. */
-@property(nonnull, readonly) NSString* name;
+- (BOOL)supportsFamily: (MTLGPUFamily)gpuFamily;
+- (BOOL)supportsFeatureSet: (MTLFeatureSet)featureSet;
+- (BOOL)supportsTextureSampleCount: (NSUInteger)sampleCount;
 
-/*! The selectors below are deliberately NOT declared, so a caller that reaches
- for one gets an unrecognised selector naming the gap. Each is a question about
- the hardware that indium cannot answer, and a plausible answer would be worse
- than the error:
+/* Whether R32Float, RG32Float and RGBA32Float textures can be sampled with linear filtering. */
+@property(readonly) BOOL supports32BitFloatFiltering;
 
- -supportsCounterSampling: asks what the underlying GPU can do. MTLCounterSamplingPoint
- enumerates where Metal may sample counters, and indium has no query pool at all,
- so it has no sampling point to report on. It is not declared until indium can say
- something true.
+/* Whether the block-compressed BC1 to BC7 texture formats can be sampled. */
+@property(readonly) BOOL supportsBCTextureCompression;
 
- -supportsFamily: IS declared, and answers for Apple1 only. MTLGPUFamily is Apple's own
- numbering of silicon generations and Vulkan has no property that maps onto it --
- deviceName is a free-form string and vendorID/deviceID identify the driver, not
- the GPU family. So this does not ask indium; it answers for the hardware Darling's
- Metal is written against, and NO for every other family. A caller asking about a
- family we do not claim takes the conservative branch, which is the one that cannot
- select a path we cannot run.
+/* Always NO: Vulkan has no interpolate-at-offset/sample/centroid operations to lower the
+ * shader's pull-model calls onto. */
+@property(readonly) BOOL supportsPullModelInterpolation;
 
- -minimumLinearTextureAlignmentForPixelFormat: returns the alignment Metal
- requires of a linear texture's offset and rowBytes, per pixel format, and
- throws for depth, stencil and compressed formats. Apple states the requirement
- but not the table, so there is nothing here to derive a value from, and indium
- does not enforce any linear-texture alignment for it to report: its
- replaceRegion: passes bytesPerRow straight through unvalidated. Returning a
- Vulkan limit such as optimalBufferCopyOffsetAlignment would answer a different
- question, since that bounds buffer copies rather than texture layout.
+/* Always NO: Vulkan has no equivalent of a shader-programmable sample position table. */
+@property(readonly, getter=areProgrammableSamplePositionsSupported) BOOL programmableSamplePositionsSupported;
 
- The remaining omitted selectors are documented where the class that would have
- provided the object is declared: -newEvent in MTLSharedEvent.h,
- -newArgumentEncoderWithArguments: in MTLArgumentDescriptor.h,
- -newCommandQueueWithMaxCommandBufferCount: in MTLCommandQueue.h,
- -newBinaryArchiveWithDescriptor:error: in MTLBinaryArchive.h,
- -newCounterSampleBufferWithDescriptor:error: in MTLCounterSampleBuffer.h, and
- the acceleration-structure selectors in MTLAccelerationStructure.h. */
+/* Always NO: raster order groups need fragment ordering that indium does not provide. */
+@property(readonly, getter=areRasterOrderGroupsSupported) BOOL rasterOrderGroupsSupported;
+
+/* Where the GPU sits, from the kind of Vulkan device: integrated is built in, discrete is in a
+ * slot, anything else (virtual, software) is unspecified. */
+@property(readonly) MTLDeviceLocation location;
+
+/* For a built-in GPU 0 when it is the low-power one and 1 otherwise; 0 for other locations. */
+@property(readonly) NSUInteger locationNumber;
+
+/* nil: indium offers no GPU counter sets. */
+@property(readonly, nullable) NSArray<id<MTLCounterSet>>* counterSets;
+
+/* Reports Tier 1 argument buffers support (baseline tier). indium does not
+ * implement Tier 2 argument buffers. */
+- (MTLArgumentBuffersTier)argumentBuffersSupport;
+
+/* Also NO for want of an implementation rather than for want of hardware.
+ * Barycentric coordinates are a fragment-shader interpolation decoration, and
+ * Vulkan has no equivalent, so there is nothing for indium to lower a shader's
+ * use of them onto. A caller told YES would emit a shader whose output no
+ * longer means what it says. */
+- (BOOL)supportsShaderBarycentricCoordinates;
+
+- (id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount: (NSUInteger)maxCommandBufferCount;
 
 - (id<MTLComputePipelineState>)newComputePipelineStateWithDescriptor: (MTLComputePipelineDescriptor*)descriptor
                                                              options: (MTLPipelineOption)options
@@ -145,8 +222,16 @@ MTL_EXPORT void MTLRemoveDeviceObserver(id<NSObject> observer);
 
 - (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor: (MTLRenderPipelineDescriptor*)descriptor
                                                              error: (NSError**)error;
+- (id<MTLRenderPipelineState>)newRenderPipelineStateWithDescriptor: (MTLRenderPipelineDescriptor*)descriptor
+                                                           options: (MTLPipelineOption)options
+                                                        reflection: (MTLAutoreleasedRenderPipelineReflection*)reflection
+                                                             error: (NSError**)error;
 
 - (id<MTLTexture>)newTextureWithDescriptor: (MTLTextureDescriptor*)descriptor;
+
+- (id<MTLTexture>)newTextureWithDescriptor: (MTLTextureDescriptor*)descriptor
+                                 iosurface: (IOSurfaceRef)iosurface
+                                     plane: (NSUInteger)plane;
 
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor: (MTLSamplerDescriptor*)descriptor;
 
@@ -154,8 +239,34 @@ MTL_EXPORT void MTLRemoveDeviceObserver(id<NSObject> observer);
 
 - (id<MTLCommandQueue>)newCommandQueue;
 
+- (id<MTLEvent>)newEvent;
+- (id<MTLSharedEvent>)newSharedEvent;
+
+/* The event the handle names, as an object of its own that shares the value; nil for a handle of another device. */
+- (nullable id<MTLSharedEvent>)newSharedEventWithHandle: (MTLSharedEventHandle*)sharedEventHandle;
+- (id<MTLFence>)newFence;
+
 - (id<MTLBuffer>)newBufferWithLength: (NSUInteger)length
                              options: (MTLResourceOptions)options;
+
+// The row alignment, in bytes, of a texture made from a buffer in `format`: its bytesPerRow is a multiple of it.
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat: (MTLPixelFormat)format;
+
+// A heap of device memory to make buffers and textures from. nil for a descriptor with a size of 0, a sparse heap, a heap
+// with a storage mode other than shared and private, or a size the device cannot allocate.
+- (nullable id<MTLHeap>)newHeapWithDescriptor: (MTLHeapDescriptor*)descriptor;
+
+// What a buffer or texture takes in a heap on this device, and the alignment of the offset it must be placed at in a
+// placement heap. These are the device's own requirements; the sizes include its rounding, and are what a heap counts
+// (usedSize) and what the resource reports as its allocatedSize.
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength: (NSUInteger)length
+                                            options: (MTLResourceOptions)options;
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor: (MTLTextureDescriptor*)desc;
+
+// The host and device clocks sampled together, in nanoseconds. Both are the host's monotonic clock here, so
+// the two timestamps are equal and counter sample buffers do not exist for them to be compared with.
+- (void)sampleTimestamps: (MTLTimestamp*)cpuTimestamp
+            gpuTimestamp: (MTLTimestamp*)gpuTimestamp;
 
 - (id<MTLBuffer>)newBufferWithBytes: (const void*)pointer
                              length: (NSUInteger)length
@@ -176,31 +287,9 @@ MTL_EXPORT void MTLRemoveDeviceObserver(id<NSObject> observer);
                                         options: (nullable MTLCompileOptions*)options
                                           error: (NSError**)error;
 
-@property (readonly, getter=isLowPower) BOOL lowPower;
-@property (readonly, getter=isHeadless) BOOL headless;
-@property (readonly, getter=isRemovable) BOOL removable;
-
 // TODO: other methods and properties
 
-/* Games query these before choosing a render path. Implemented as constants rather
- * than left to crash: a selector miss on MTLDevice takes the whole app down at
- * startup, which is how this was found. */
-- (BOOL) supportsTextureSampleCount: (NSUInteger)count;
-
-  /* Reports Tier 1 argument buffers support (baseline tier). indium does not
-   * implement Tier 2 argument buffers. */
-  - (MTLArgumentBuffersTier) argumentBuffersSupport;
-
-  /* Also NO for want of an implementation rather than for want of hardware.
-   * Barycentric coordinates are a fragment-shader interpolation decoration, and
-   * Vulkan has no equivalent, so there is nothing for indium to lower a shader's
-   * use of them onto. A caller told YES would emit a shader whose output no
-   * longer means what it says. */
-  - (BOOL) supportsShaderBarycentricCoordinates;
-
-  - (BOOL) supportsFamily: (MTLGPUFamily)family;
-
-  @end
+@end
 
 METAL_DECLARATIONS_END
 

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Darling Developers
 // SPDX-License-Identifier: MPL-2.0
 
+#include <array>
 #import <Metal/MTLMSLReflection.h>
 #import <Metal/stubs.h>
 #import <CoreFoundation/CoreFoundation.h>
@@ -171,6 +172,21 @@ static bool MTLReadBindings(NSArray* bindings, Indium::FunctionReflection& outFu
 		if ([kind isEqualToString: @"Buffer"]) binding.type = Indium::BindingType::Buffer;
 		else if ([kind isEqualToString: @"Texture"]) binding.type = Indium::BindingType::Texture;
 		else if ([kind isEqualToString: @"Sampler"]) binding.type = Indium::BindingType::Sampler;
+		else if ([kind isEqualToString: @"VertexInput"]) {
+			// A [[stage_in]] field of a vertex function. Its metal_index is the
+			// field's attribute index, which is also the location of the shader
+			// input, and it has no descriptor: indium keys the vertex descriptor
+			// by that index and ignores the internal index.
+			if (outFunction.functionType != Indium::FunctionType::Vertex ||
+				!MTLReadIndex([object objectForKey: @"metal_index"], binding.index))
+			{
+				outError = MTLReflectionError(@"invalid vertex input binding");
+				return false;
+			}
+			binding.type = Indium::BindingType::VertexInput;
+			outFunction.bindings.push_back(binding);
+			continue;
+		}
 		else {
 			outError = MTLReflectionError(@"unsupported reflection binding kind '%@'", kind);
 			return false;
@@ -308,6 +324,25 @@ bool MTLReadMSLReflection(const char* document, size_t length,
 			functionReflection, outError) ||
 			!MTLReadBindings((NSArray*)bindings, functionReflection, outError)) {
 			return false;
+		}
+
+		// the specialization constants that hold the grid size of a kernel that skips the threads beyond it
+		id gridSizeIDs = [entryObject objectForKey: @"grid_size_spec_ids"];
+		if (gridSizeIDs != nil) {
+			if (![gridSizeIDs isKindOfClass: [NSArray class]] || [(NSArray*)gridSizeIDs count] != 3) {
+				outError = MTLReflectionError(@"mslc's reflection has grid_size_spec_ids that is not an array of three numbers");
+				return false;
+			}
+			std::array<uint32_t, 3> ids;
+			for (NSUInteger i = 0; i < 3; i++) {
+				id number = [(NSArray*)gridSizeIDs objectAtIndex: i];
+				if (![number isKindOfClass: [NSNumber class]] || [number longLongValue] < 3 || [number longLongValue] > UINT32_MAX) {
+					outError = MTLReflectionError(@"mslc's reflection has grid_size_spec_ids that is not an array of three numbers");
+					return false;
+				}
+				ids[i] = (uint32_t)[number longLongValue];
+			}
+			functionReflection.gridSizeSpecializationIDs = ids;
 		}
 
 		NSString* entryPoint = nil;

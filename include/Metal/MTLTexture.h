@@ -5,6 +5,7 @@
 #define _METAL_MTLTEXTURE_H_
 
 #import <Foundation/Foundation.h>
+#import <IOSurface/IOSurfaceRef.h>
 
 #import <Metal/MTLDefines.h>
 #import <Metal/MTLResource.h>
@@ -56,6 +57,8 @@ MTLTextureSwizzleChannels MTLTextureSwizzleChannelsMake(MTLTextureSwizzle red, M
 
 #define MTLTextureSwizzleChannelsDefault MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleGreen, MTLTextureSwizzleBlue, MTLTextureSwizzleAlpha)
 
+@protocol MTLBuffer;
+
 @protocol MTLTexture <MTLResource>
 
 @property(readonly) MTLTextureType textureType;
@@ -71,6 +74,14 @@ MTLTextureSwizzleChannels MTLTextureSwizzleChannelsMake(MTLTextureSwizzle red, M
 @property(readonly) BOOL allowGPUOptimizedContents;
 @property(readonly, getter=isShareable) BOOL shareable;
 @property(readonly, nonatomic) MTLTextureSwizzleChannels swizzle;
+@property(readonly) IOSurfaceRef iosurface;
+@property(readonly) NSUInteger iosurfacePlane;
+
+// The buffer a texture made with -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:] reads its rows from, where
+// they start and how far apart they are; nil and 0 for any other texture.
+@property(nullable, readonly) id<MTLBuffer> buffer;
+@property(readonly) NSUInteger bufferOffset;
+@property(readonly) NSUInteger bufferBytesPerRow;
 
 - (id<MTLTexture>)newTextureViewWithPixelFormat: (MTLPixelFormat)pixelFormat;
 

@@ -4,8 +4,136 @@
 #import <Metal/MTLLibraryInternal.h>
 #import <Metal/MTLDevice.h>
 #import <Metal/stubs.h>
+#import <Metal/MTLIndiumErrors.h>
+#import <Metal/MTLAttributeInfo.h>
+#include <cstring>
 
 MTL_EXTERN NSErrorDomain const MTLLibraryErrorDomain = @"MTLLibraryErrorDomain";
+
+@interface MTLFunctionConstant ()
+- (instancetype)initWithName: (NSString*)name type: (MTLDataType)type index: (NSUInteger)index;
+@end
+
+@implementation MTLFunctionConstant
+
+@synthesize name = _name;
+@synthesize type = _type;
+@synthesize index = _index;
+
+- (instancetype)initWithName: (NSString*)name type: (MTLDataType)type index: (NSUInteger)index
+{
+	self = [super init];
+	if (self != nil) {
+		_name = [name copy];
+		_type = type;
+		_index = index;
+	}
+	return self;
+}
+
+- (void)dealloc
+{
+	[_name release];
+	[super dealloc];
+}
+
+- (BOOL)required
+{
+	return YES;
+}
+
+@end
+
+
+// MTLVertexAttribute and MTLAttribute carry the same four facts. Their instances are only made for a
+// function's reflection.
+@interface MTLVertexAttribute ()
+- (instancetype)initWithName: (NSString*)name index: (NSUInteger)index type: (MTLDataType)type;
+@end
+
+@interface MTLAttribute ()
+- (instancetype)initWithName: (NSString*)name index: (NSUInteger)index type: (MTLDataType)type;
+@end
+
+@implementation MTLVertexAttribute
+
+@synthesize name = _name;
+@synthesize attributeIndex = _attributeIndex;
+@synthesize attributeType = _attributeType;
+
+- (instancetype)initWithName: (NSString*)name index: (NSUInteger)index type: (MTLDataType)type
+{
+	self = [super init];
+	if (self != nil) {
+		_name = [name copy];
+		_attributeIndex = index;
+		_attributeType = type;
+	}
+	return self;
+}
+
+- (void)dealloc
+{
+	[_name release];
+	[super dealloc];
+}
+
+- (BOOL)isActive
+{
+	return YES;
+}
+
+- (BOOL)isPatchData
+{
+	return NO;
+}
+
+- (BOOL)isPatchControlPointData
+{
+	return NO;
+}
+
+@end
+
+@implementation MTLAttribute
+
+@synthesize name = _name;
+@synthesize attributeIndex = _attributeIndex;
+@synthesize attributeType = _attributeType;
+
+- (instancetype)initWithName: (NSString*)name index: (NSUInteger)index type: (MTLDataType)type
+{
+	self = [super init];
+	if (self != nil) {
+		_name = [name copy];
+		_attributeIndex = index;
+		_attributeType = type;
+	}
+	return self;
+}
+
+- (void)dealloc
+{
+	[_name release];
+	[super dealloc];
+}
+
+- (BOOL)isActive
+{
+	return YES;
+}
+
+- (BOOL)isPatchData
+{
+	return NO;
+}
+
+- (BOOL)isPatchControlPointData
+{
+	return NO;
+}
+
+@end
 
 @implementation MTLFunctionInternal
 
@@ -32,7 +160,46 @@ MTL_EXTERN NSErrorDomain const MTLLibraryErrorDomain = @"MTLLibraryErrorDomain";
 		_device = [device retain];
 
 		// cache the name
-		_name = [NSString stringWithUTF8String: _function->name().c_str()];
+		_name = [[NSString alloc] initWithUTF8String: _function->name().c_str()];
+		// Indium's FunctionType values are Metal's
+		_functionType = static_cast<MTLFunctionType>(_function->functionType());
+
+		NSMutableDictionary<NSString*, MTLFunctionConstant*>* constants = [NSMutableDictionary dictionary];
+		for (const auto& constant: _function->functionConstants()) {
+			MTLDataType type = MTLDataTypeNone;
+			switch (constant.type) {
+				case Indium::FunctionConstantType::Bool: type = MTLDataTypeBool; break;
+				case Indium::FunctionConstantType::Int: type = MTLDataTypeInt; break;
+				case Indium::FunctionConstantType::UInt: type = MTLDataTypeUInt; break;
+				case Indium::FunctionConstantType::Float: type = MTLDataTypeFloat; break;
+			}
+			NSString* constantName = [NSString stringWithUTF8String: constant.name.c_str()];
+			MTLFunctionConstant* object = [[MTLFunctionConstant alloc] initWithName: constantName type: type index: constant.index];
+			constants[constantName] = object;
+			[object release];
+		}
+		_functionConstantsDictionary = [constants copy];
+
+		// a vertex function's [[stage_in]] attributes; the other stages' inputs are not reflected
+		if (_functionType == MTLFunctionTypeVertex) {
+			NSMutableArray<MTLVertexAttribute*>* vertexAttributes = [NSMutableArray array];
+			NSMutableArray<MTLAttribute*>* stageInputAttributes = [NSMutableArray array];
+			for (const auto& info: _function->argumentInfo()) {
+				if (info.kind != Indium::ArgumentKind::VertexInput) {
+					continue;
+				}
+				NSString* attributeName = [NSString stringWithUTF8String: info.name.c_str()] ?: @"";
+				MTLDataType type = static_cast<MTLDataType>(MTLAttributeInfo::dataTypeFromName(info.typeName));
+				MTLVertexAttribute* vertexAttribute = [[MTLVertexAttribute alloc] initWithName: attributeName index: info.index type: type];
+				MTLAttribute* stageInputAttribute = [[MTLAttribute alloc] initWithName: attributeName index: info.index type: type];
+				[vertexAttributes addObject: vertexAttribute];
+				[stageInputAttributes addObject: stageInputAttribute];
+				[vertexAttribute release];
+				[stageInputAttribute release];
+			}
+			_vertexAttributes = [vertexAttributes copy];
+			_stageInputAttributes = [stageInputAttributes copy];
+		}
 	}
 	return self;
 }
@@ -142,11 +309,108 @@ MTL_UNSUPPORTED_CLASS
 
 - (id<MTLFunction>)newFunctionWithName: (NSString*)functionName
 {
-	auto func = _library->newFunction(functionName.UTF8String);
+	if (!functionName) {
+		return nil;
+	}
+	// this selector has no error out-parameter: a function Indium cannot create is nil
+	auto func = MTLCallIndium(nullptr, MTLLibraryErrorFunctionNotFound, [&]() {
+		return _library->newFunction(functionName.UTF8String);
+	});
 	if (!func) {
 		return nil;
 	}
 	return [[MTLFunctionInternal alloc] initWithFunction: func device: _device];
+}
+
+- (id<MTLFunction>)newFunctionWithName: (NSString*)functionName
+                        constantValues: (MTLFunctionConstantValues*)constantValues
+                                 error: (NSError**)error
+{
+	if (error) {
+		*error = nil;
+	}
+	if (!functionName) {
+		MTLSetError(error, MTLLibraryErrorFunctionNotFound, @"No function name");
+		return nil;
+	}
+
+	// the function's own constants say which of the values apply to it
+	auto plain = MTLCallIndium(error, MTLLibraryErrorFunctionNotFound, [&]() {
+		return _library->newFunction(functionName.UTF8String);
+	});
+	if (!plain) {
+		if (error && !*error) {
+			MTLSetError(error, MTLLibraryErrorFunctionNotFound, [NSString stringWithFormat: @"Function '%@' was not found in the library", functionName]);
+		}
+		return nil;
+	}
+
+	Indium::FunctionConstantValues values;
+	NSDictionary* byIndex = [constantValues constantsByIndex];
+	NSDictionary* byName = [constantValues constantsByName];
+	for (const auto& constant: plain->functionConstants()) {
+		NSString* constantName = [NSString stringWithUTF8String: constant.name.c_str()];
+		// a value set by index takes precedence over one set by name
+		NSDictionary* entry = byIndex[@(constant.index)] ?: byName[constantName];
+		if (entry == nil) {
+			continue;
+		}
+
+		MTLDataType type = static_cast<MTLDataType>([entry[@"type"] unsignedIntegerValue]);
+		NSData* data = entry[@"data"];
+		uint32_t bits = 0;
+		Indium::FunctionConstantType expected = constant.type;
+		bool matches = false;
+		switch (expected) {
+			case Indium::FunctionConstantType::Bool:
+				matches = type == MTLDataTypeBool && data.length == 1;
+				bits = matches && *static_cast<const uint8_t*>(data.bytes) != 0 ? 1 : 0;
+				break;
+			case Indium::FunctionConstantType::Int:
+				matches = type == MTLDataTypeInt && data.length == 4;
+				break;
+			case Indium::FunctionConstantType::UInt:
+				matches = type == MTLDataTypeUInt && data.length == 4;
+				break;
+			case Indium::FunctionConstantType::Float:
+				matches = type == MTLDataTypeFloat && data.length == 4;
+				break;
+		}
+		if (!matches) {
+			MTLSetError(error, MTLLibraryErrorCompileFailure, [NSString stringWithFormat: @"The value for function constant '%@' (index %lu) does not have the constant's type", constantName, (unsigned long)constant.index]);
+			return nil;
+		}
+		if (expected != Indium::FunctionConstantType::Bool) {
+			memcpy(&bits, data.bytes, sizeof(bits));
+		}
+		values.setValue(constant.index, expected, bits);
+	}
+
+	std::string message;
+	auto func = MTLCallIndium(error, MTLLibraryErrorCompileFailure, [&]() {
+		return _library->newFunction(functionName.UTF8String, values, &message);
+	});
+	if (!func) {
+		if (error && !*error) {
+			MTLSetError(error, MTLLibraryErrorCompileFailure, [NSString stringWithUTF8String: message.c_str()]);
+		}
+		return nil;
+	}
+	return [[MTLFunctionInternal alloc] initWithFunction: func device: _device];
+}
+
+- (void)newFunctionWithName: (NSString*)functionName
+             constantValues: (MTLFunctionConstantValues*)constantValues
+          completionHandler: (void (^)(id<MTLFunction> function, NSError* error))completionHandler
+{
+	NSError* error = nil;
+	id<MTLFunction> function = [self newFunctionWithName: functionName constantValues: constantValues error: &error];
+	void (^handler)(id<MTLFunction>, NSError*) = [completionHandler copy];
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+		handler(function, error);
+		[function release];
+		[handler release];
+	});
 }
 
 #else
